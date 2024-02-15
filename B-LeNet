@@ -1,0 +1,140 @@
+import tensorflow as tf
+import numpy as np
+import time
+from tensorflow.keras.datasets import mnist
+from tensorflow.keras.utils import to_categorical
+
+# 데이터 로드 및 전처리
+(train_images, train_labels), (test_images, test_labels) = mnist.load_data()
+train_images = train_images.reshape((60000, 28, 28, 1)).astype('float32') / 255
+test_images = test_images.reshape((10000, 28, 28, 1)).astype('float32') / 255
+train_labels = to_categorical(train_labels)
+test_labels = to_categorical(test_labels)
+
+# B-LeNet 모델 정의
+class BLeNet(tf.keras.Model):
+    def __init__(self):
+        super(BLeNet, self).__init__()
+        self.conv1 = tf.keras.layers.Conv2D(6, (5,5), activation='relu')
+        self.pool1 = tf.keras.layers.MaxPooling2D((2,2))
+        self.conv2 = tf.keras.layers.Conv2D(16, (5,5), activation='relu')
+        self.pool2 = tf.keras.layers.MaxPooling2D((2,2))
+        self.flatten = tf.keras.layers.Flatten()
+        self.dense1 = tf.keras.layers.Dense(120, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(84, activation='relu')
+        self.dense3 = tf.keras.layers.Dense(10, activation='softmax')
+        self.branch_dense = tf.keras.layers.Dense(10, activation='softmax')
+
+    def call(self, x):
+        x1 = self.conv1(x)
+        x = self.pool1(x1)
+        x2 = self.conv2(x)
+        x = self.pool2(x2)
+        branch_output = self.branch_dense(self.flatten(x1))  # branch output
+        x = self.flatten(x)
+        x = self.dense1(x)
+        x = self.dense2(x)
+        main_output = self.dense3(x)  # main output
+        return main_output, branch_output
+
+# 모델 초기화
+model = BLeNet()
+
+# 손실 함수 설정
+loss_fn = tf.keras.losses.CategoricalCrossentropy()
+
+# 옵티마이저 설정
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, beta_1=0.99, beta_2=0.999)
+
+# 가중치 설정
+weights = np.array([1.0, 0.3], dtype=np.float32)
+
+# 가중치가 적용된 손실 함수
+def weighted_loss(y_true, y_pred, weights):
+    loss = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+    return tf.reduce_mean(loss * weights)
+
+# 훈련 함수 정의
+@tf.function
+def train_step(images, labels, model, loss_fn, optimizer, weights):
+    with tf.GradientTape() as tape:
+        main_output, branch_output = model(images)
+        loss = weighted_loss(labels, main_output, weights[0]) + weighted_loss(labels, branch_output, weights[1])
+    gradients = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+    # 정확도 계산
+    correct_main = tf.equal(tf.argmax(main_output, 1), tf.argmax(labels, 1))
+    correct_branch = tf.equal(tf.argmax(branch_output, 1), tf.argmax(labels, 1))
+    accuracy_main = tf.reduce_mean(tf.cast(correct_main, tf.float32))
+    accuracy_branch = tf.reduce_mean(tf.cast(correct_branch, tf.float32))
+
+    return loss, accuracy_main, accuracy_branch
+
+# 훈련 데이터셋을 사용하여 모델 훈련
+for epoch in range(20):  # 20 epoch 동안 훈련
+    total_loss = 0
+    total_accuracy_main = 0
+    total_accuracy_branch = 0
+    num_batches = 0
+    for i in range(0, len(train_images), 32):  # 32의 배치 크기로 훈련
+        images = train_images[i:i+32]
+        labels = train_labels[i:i+32]
+        loss, accuracy_main, accuracy_branch = train_step(images, labels, model, loss_fn, optimizer, weights)
+        total_loss += loss
+        total_accuracy_main += accuracy_main
+        total_accuracy_branch += accuracy_branch
+        num_batches += 1
+
+    avg_loss = total_loss / num_batches
+    avg_accuracy_main = total_accuracy_main / num_batches
+    avg_accuracy_branch = total_accuracy_branch / num_batches
+    print(f"Epoch {epoch}, Loss: {avg_loss.numpy()}, Main Accuracy: {avg_accuracy_main.numpy()*100:.2f}%, Branch Accuracy: {avg_accuracy_branch.numpy()*100:.2f}%")
+
+# 빠른 추론 함수
+def fast_inference(model, x, threshold):
+    main_output, branch_output = model(x)
+    outputs = [branch_output, main_output]
+    predictions = []
+    exits = []
+
+    # Check the output from each exit
+    for i, output in enumerate(outputs):
+        entropy = -np.sum(output * np.log(output + 1e-20), axis=-1)
+        pred = np.argmax(output.numpy(), axis=-1)
+        exit = np.less(entropy, threshold)
+        predictions.append(pred)
+        exits.append(exit)
+
+    # After checking all exits, return the output from the last exit
+    predictions = np.stack(predictions, axis=-1)
+    exits = np.stack(exits, axis=-1)
+    last_exit = np.argmax(exits, axis=-1)
+    final_predictions = np.take_along_axis(predictions, np.expand_dims(last_exit, axis=-1), axis=-1).squeeze(axis=-1)
+
+    return final_predictions, last_exit
+
+# 테스트 데이터셋을 사용하여 빠른 추론 수행 및 시간 측정
+start_time = time.time()
+threshold = 0.025
+
+# Flatten the test dataset to (num_samples, height, width, channels)
+test_images_flat = test_images.reshape((len(test_images), 28, 28, 1))
+
+# Perform batch inference
+predictions, exits = fast_inference(model, test_images_flat, threshold)
+
+# Calculate accuracy and exit ratios
+total_correct = np.sum(predictions == np.argmax(test_labels, axis=-1))
+exit_counts = np.zeros(2)
+unique, counts = np.unique(exits, return_counts=True)
+exit_counts[unique] += counts
+accuracy = total_correct / len(test_images)
+
+# Print results
+end_time = time.time()
+total_time = end_time - start_time
+print(f"Accuracy: {accuracy*100:.2f}%")
+print(f"Time: {total_time:.2f} seconds")
+exit_ratios_percentage = exit_counts / len(test_images) * 100
+print(f"Exit ratios: {exit_ratios_percentage[0]:.2f}% (Exit 0), {exit_ratios_percentage[1]:.2f}% (Exit 1)")
